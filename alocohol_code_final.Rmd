@@ -1,0 +1,575 @@
+---
+title: "Project 3 – Wine Quality: Models + Graphics"
+output: html_document
+---
+
+# Project 3 – Wine Quality: Models + Graphics
+
+- residual ~ predictor plots for each model  
+- train vs validation RMSE for each model  
+
+```{r sec0, message=FALSE, warning=FALSE}
+## ---- 0. Setup ----
+
+# Install/load packages only if needed
+pkgs <- c("broom", "dplyr", "readr", "car", "leaps", "MASS")
+for (p in pkgs) {
+  if (!require(p, character.only = TRUE)) {
+    install.packages(p)
+    library(p, character.only = TRUE)
+  }
+}
+
+set.seed(24)
+```
+
+```{r sec1, message=FALSE, warning=FALSE}
+## ---- 1. Load data and split into train / validation ----
+
+data <- read_csv("winequality-red.csv")
+
+data <- data %>%
+  mutate(
+    quality_cat = case_when(
+      quality <= 6 ~ "bad",
+      quality >  6 ~ "good"
+    )
+  )
+
+n <- nrow(data)
+train_idx  <- sample(seq_len(n), size = floor(0.8 * n))
+train_data <- data[train_idx, ]
+valid_data <- data[-train_idx, ]
+```
+
+```{r sec2, message=FALSE, warning=FALSE}
+## ---- 2. Helper functions ----
+
+# Box–Cox-style transform for predictors
+bc_transform <- function(x, lambda) {
+  if (lambda == 0) return(log(x))
+  (x ^ lambda - 1) / lambda
+}
+
+# Power transform for response (this matches how bc_alcohol was defined)
+power_transform <- function(x, lambda) x ^ lambda
+
+# Inverse of power transform
+inv_power_transform <- function(y, lambda) {
+  # guard against non-positive predictions (for negative lambda)
+  y <- pmax(y, .Machine$double.eps)
+  y ^ (1 / lambda)
+}
+
+# RMSE function
+rmse <- function(actual, predicted) {
+  sqrt(mean((actual - predicted)^2, na.rm = TRUE))
+}
+
+# Residual vs predictor plots (numeric -> scatter, categorical -> boxplot)
+plot_resid_vs_predictors <- function(model_obj, data, model_name = "Model") {
+  res <- residuals(model_obj)
+  preds <- attr(terms(model_obj), "term.labels")
+  # keep only predictors that are actual columns (drop interactions)
+  preds <- preds[preds %in% names(data)]
+  
+  for (pred in preds) {
+    x <- data[[pred]]
+    
+    if (is.numeric(x)) {
+      plot(
+        x, res,
+        main = paste(model_name, "- Residuals vs", pred),
+        xlab = pred,
+        ylab = "Residuals"
+      )
+      abline(h = 0, col = "red", lty = 2)
+    } else {
+      boxplot(
+        res ~ x,
+        main = paste(model_name, "- Residuals vs", pred),
+        xlab = pred,
+        ylab = "Residuals"
+      )
+      abline(h = 0, col = "red", lty = 2)
+    }
+  }
+  par(mfrow = c(1, 1))
+}
+```
+
+```{r sec3, message=FALSE, warning=FALSE}
+## ---- 3. Baseline model: raw alcohol (call this model1 = 'model') ----
+
+model <- lm(alcohol ~ . -quality, data = train_data)   # baseline
+model1 <- update(model,.~. + `volatile acidity`*quality_cat )# alias for clarity
+
+y_hat1 <- fitted(model1)
+resid1 <- residuals(model1)
+
+# Basic diagnostics
+par(mfrow = c(1, 2))
+plot(
+  y_hat1, train_data$alcohol,
+  main = "Model1 (raw y): Actual vs Fitted",
+  xlab = "Fitted alcohol",
+  ylab = "Actual alcohol"
+)
+abline(0, 1, col = "red", lty = 2)
+
+plot(
+  y_hat1, resid1,
+  main = "Model1 (raw y): Residuals vs Fitted",
+  xlab = "Fitted alcohol",
+  ylab = "Residuals"
+)
+abline(h = 0, col = "red", lty = 2)
+par(mfrow = c(1, 1))
+
+qqnorm(resid1, main = "Model1 (raw y): Q-Q plot")
+qqline(resid1, col = "red")
+
+# Residual vs predictor plots for Model1
+plot_resid_vs_predictors(model1, train_data, "Model1 (raw y)")
+```
+
+```{r sec4, message=FALSE, warning=FALSE}
+## ---- 4. Transform response: bc_alcohol = alcohol^(-0.8) ----
+
+lambda_alc <- -0.8
+train_data$bc_alcohol <- power_transform(train_data$alcohol, lambda_alc)
+bc_alcohol <- train_data$bc_alcohol   # keep vector name used later
+
+# Show effect of response transformation
+par(mfrow = c(1, 2))
+hist(train_data$alcohol,
+     main = "Alcohol (raw)", xlab = "alcohol")
+hist(train_data$bc_alcohol,
+     main = "Alcohol^(-0.8)", xlab = "bc_alcohol")
+par(mfrow = c(1, 1))
+```
+
+```{r sec5, message=FALSE, warning=FALSE}
+## ---- 5. Model2: same predictors, transformed response ----
+
+model2 <- update(model1, bc_alcohol ~ . - alcohol -quality)
+
+y_hat2 <- fitted(model2)
+resid2 <- residuals(model2)
+
+par(mfrow = c(1, 2))
+plot(
+  y_hat2, bc_alcohol,
+  main = "Model2: Actual vs Fitted (bc_alcohol)",
+  xlab = "Fitted bc_alcohol",
+  ylab = "Actual bc_alcohol"
+)
+abline(0, 1, col = "red", lty = 2)
+
+plot(
+  y_hat2, resid2,
+  main = "Model2: Residuals vs Fitted",
+  xlab = "Fitted bc_alcohol",
+  ylab = "Residuals"
+)
+abline(h = 0, col = "red", lty = 2)
+par(mfrow = c(1, 1))
+
+qqnorm(resid2, main = "Model2: Q-Q plot (bc_alcohol)")
+qqline(resid2, col = "red")
+
+# Residual vs predictor plots for Model2
+plot_resid_vs_predictors(model2, train_data, "Model2 (bc_alcohol)")
+```
+
+```{r sec6, message=FALSE, warning=FALSE}
+## ---- 6. Model3: add residual sugar * chlorides interaction ----
+
+model3 <- update(model2, . ~ . + `residual sugar` * chlorides)
+
+anova(model2, model3)
+BIC(model2, model3)
+
+resid3 <- residuals(model3)
+qqnorm(resid3, main = "Model3: Q-Q plot")
+qqline(resid3, col = "red")
+
+# Residual vs predictor plots for Model3
+plot_resid_vs_predictors(model3, train_data, "Model3")
+```
+
+```{r sec7, message=FALSE, warning=FALSE}
+## ---- 7. Transform key predictors (Box–Cox lambdas from bcPower) ----
+
+# (You may already have run this at some point)
+# summary(powerTransform(cbind(data[, c(4, 5, 6, 7, 10)])))
+
+train_data$bc_residual_sugar <- bc_transform(train_data$`residual sugar`,      -1.19)
+train_data$bc_chlorides      <- bc_transform(train_data$chlorides,             -0.50)
+train_data$bc_free_SO2       <- bc_transform(train_data$`free sulfur dioxide`,  0.07)
+train_data$bc_total_SO2      <- bc_transform(train_data$`total sulfur dioxide`, -0.08)
+train_data$bc_sulphates      <- bc_transform(train_data$sulphates,             -1.00)
+
+# Before vs after transformation for each X
+par(mfrow = c(2, 5))
+hist(train_data$`residual sugar`,
+     main = "Residual sugar (raw)", xlab = "")
+hist(train_data$bc_residual_sugar,
+     main = "Residual sugar (BC)", xlab = "")
+
+hist(train_data$chlorides,
+     main = "Chlorides (raw)", xlab = "")
+hist(train_data$bc_chlorides,
+     main = "Chlorides (BC)", xlab = "")
+
+hist(train_data$`free sulfur dioxide`,
+     main = "Free SO2 (raw)", xlab = "")
+hist(train_data$bc_free_SO2,
+     main = "Free SO2 (BC)", xlab = "")
+
+hist(train_data$`total sulfur dioxide`,
+     main = "Total SO2 (raw)", xlab = "")
+hist(train_data$bc_total_SO2,
+     main = "Total SO2 (BC)", xlab = "")
+
+hist(train_data$sulphates,
+     main = "Sulphates (raw)", xlab = "")
+hist(train_data$bc_sulphates,
+     main = "Sulphates (BC)", xlab = "")
+par(mfrow = c(1, 1))
+```
+
+```{r sec8, message=FALSE, warning=FALSE}
+## ---- 8. Model4: use BC-transformed Xs instead of raw Xs ----
+
+model4 <- update(
+  model2,
+  . ~ .
+  - `residual sugar`
+  - chlorides
+  - `free sulfur dioxide`
+  - `total sulfur dioxide`
+  - sulphates
+  + bc_residual_sugar
+  + bc_chlorides
+  + bc_free_SO2
+  + bc_total_SO2
+  + bc_sulphates,
+  data = train_data
+)
+
+y_hat4 <- fitted(model4)
+resid4 <- residuals(model4)
+
+par(mfrow = c(1, 2))
+plot(
+  y_hat4, bc_alcohol,
+  main = "Model4: Actual vs Fitted",
+  xlab = "Fitted bc_alcohol",
+  ylab = "Actual bc_alcohol"
+)
+abline(0, 1, col = "red", lty = 2)
+
+plot(
+  y_hat4, resid4,
+  main = "Model4: Residuals vs Fitted",
+  xlab = "Fitted bc_alcohol",
+  ylab = "Residuals"
+)
+abline(h = 0, col = "red", lty = 2)
+par(mfrow = c(1, 1))
+
+par(mfrow = c(1, 2))
+qqnorm(resid4, main = "Model4: Q-Q (y & X transformed)")
+qqline(resid4, col = "red")
+qqnorm(resid2, main = "Model2: Q-Q (only y transformed)")
+qqline(resid2, col = "red")
+par(mfrow = c(1, 1))
+
+# Residual vs predictor plots for Model4
+plot_resid_vs_predictors(model4, train_data, "Model4")
+```
+
+```{r sec9, message=FALSE, warning=FALSE}
+## ---- 9. Model5: drop bc_chlorides and bc_total_SO2 ----
+
+model5 <- update(model4, . ~ . - bc_chlorides - bc_total_SO2)
+anova(model5, model4)
+
+resid5 <- residuals(model5)
+qqnorm(resid5, main = "Model5: Q-Q plot")
+qqline(resid5, col = "red")
+
+# Residual vs predictor plots for Model5
+plot_resid_vs_predictors(model5, train_data, "Model5")
+```
+
+```{r sec10, message=FALSE, warning=FALSE}
+## ---- 10. Best subset selection from Model4 structure ----
+
+p_mod4 <- length(attr(terms(model4), "term.labels"))
+
+reg_fit <- regsubsets(
+  formula(model4),
+  data   = train_data,
+  nvmax  = p_mod4,
+  method = "exhaustive"
+)
+
+reg_summary <- summary(reg_fit)
+
+model_size <- 1:p_mod4
+par(mfrow = c(1, 3))
+plot(model_size, reg_summary$adjr2, type = "b",
+     xlab = "Number of predictors", ylab = "Adjusted R^2",
+     main = "Best subsets: Adjusted R^2")
+plot(model_size, reg_summary$bic, type = "b",
+     xlab = "Number of predictors", ylab = "BIC",
+     main = "Best subsets: BIC")
+plot(model_size, reg_summary$cp, type = "b",
+     xlab = "Number of predictors", ylab = "Cp",
+     main = "Best subsets: Cp")
+par(mfrow = c(1, 1))
+
+# reg_summary$outmat  # table of selected variables (printed if needed)
+```
+
+```{r sec11, message=FALSE, warning=FALSE}
+## ---- 11. Model6: final chosen model (from regsubsets) ----
+
+model6 <- lm(
+  bc_alcohol ~
+    `fixed acidity` +
+    `citric acid` +
+    density +
+    pH +
+    quality_cat + bc_residual_sugar + 
+    bc_total_SO2 + bc_sulphates + `volatile acidity`:quality_cat - 
+    `volatile acidity`,
+  data = train_data
+)
+
+summary(model6)
+anova(model6, model4)   # partial F-test vs model4
+AIC(model4, model6)
+
+resid6 <- residuals(model6)
+y_hat6 <- fitted(model6)
+
+par(mfrow = c(1, 2))
+plot(
+  y_hat6, bc_alcohol,
+  main = "Model6: Actual vs Fitted",
+  xlab = "Fitted bc_alcohol",
+  ylab = "Actual bc_alcohol"
+)
+abline(0, 1, col = "red", lty = 2)
+
+plot(
+  y_hat6, resid6,
+  main = "Model6: Residuals vs Fitted",
+  xlab = "Fitted bc_alcohol",
+  ylab = "Residuals"
+)
+abline(h = 0, col = "red", lty = 2)
+par(mfrow = c(1, 1))
+
+par(mfrow = c(1, 2))
+qqnorm(resid4, main = "Model4: Q-Q")
+qqline(resid4, col = "red")
+qqnorm(resid6, main = "Model6: Q-Q (chosen model)")
+qqline(resid6, col = "red")
+par(mfrow = c(1, 1))
+
+# Residual vs predictor plots for Model6
+plot_resid_vs_predictors(model6, train_data, "Model6 (chosen model)")
+```
+
+```{r sec12, message=FALSE, warning=FALSE}
+## ---- 12. Model7: stepwise alternative from Model4 ----
+
+model7 <- lm(
+  bc_alcohol ~ `fixed acidity` + `volatile acidity` +
+    `citric acid` + density + pH + quality_cat +
+    bc_residual_sugar + bc_total_SO2 + bc_sulphates +
+    `volatile acidity` : quality_cat,
+  data = train_data
+)
+
+summary(model7)
+
+criteria_model6 <- c(
+  adjR2 = summary(model6)$adj.r.squared,
+  AIC   = extractAIC(model6, k = 2)[2],
+  BIC   = extractAIC(model6, k = log(nrow(train_data)))[2]
+)
+criteria_model7 <- c(
+  adjR2 = summary(model7)$adj.r.squared,
+  AIC   = extractAIC(model7, k = 2)[2],
+  BIC   = extractAIC(model7, k = log(nrow(train_data)))[2]
+)
+criteria_model6
+criteria_model7
+
+# Residual vs predictor plots for Model7
+plot_resid_vs_predictors(model7, train_data, "Model7")
+```
+
+```{r sec13, message=FALSE, warning=FALSE}
+## ---- 13. Influence diagnostics for Model6 (optional, kept for completeness) ----
+
+n_train <- nrow(train_data)
+p_mod6  <- length(coef(model6))
+
+hii        <- hatvalues(model6)
+cutoff_hii <- 2 * p_mod6 / n_train
+
+ri <- rstandard(model6)
+
+di        <- cooks.distance(model6)
+cutoff_di <- qf(0.5, p_mod6, n_train - p_mod6)
+
+dffits_val    <- dffits(model6)
+cutoff_dffits <- 2 * sqrt(p_mod6 / n_train)
+
+dfbetas_val    <- dfbetas(model6)
+cutoff_dfbetas <- 2 / sqrt(n_train)
+
+par(mfrow = c(2, 2))
+plot(hii, main = "Model6: Leverage (h_ii)", ylab = "h_ii")
+abline(h = cutoff_hii, col = "red", lty = 2)
+
+plot(ri, main = "Model6: Standardized residuals", ylab = "r_i")
+abline(h = c(-2, 2), col = "red", lty = 2)
+
+plot(di, main = "Model6: Cook's distance", ylab = "D_i")
+abline(h = cutoff_di, col = "red", lty = 2)
+
+plot(dffits_val, main = "Model6: DFFITS", ylab = "DFFITS_i")
+abline(h = c(-cutoff_dffits, cutoff_dffits), col = "red", lty = 2)
+par(mfrow = c(1, 1))
+
+# DFBETAS influence by coefficient (printed if you want to inspect)
+for (j in 1:p_mod6) {
+  cat("Beta", j - 1, "\n")
+  print(which(abs(dfbetas_val[, j]) > cutoff_dfbetas))
+}
+```
+
+```{r sec14, message=FALSE, warning=FALSE}
+## ---- 14. Mirror transformations on VALIDATION data ----
+
+valid_data$bc_residual_sugar <- bc_transform(valid_data$`residual sugar`,      -1.19)
+valid_data$bc_chlorides      <- bc_transform(valid_data$chlorides,             -0.50)
+valid_data$bc_free_SO2       <- bc_transform(valid_data$`free sulfur dioxide`,  0.07)
+valid_data$bc_total_SO2      <- bc_transform(valid_data$`total sulfur dioxide`, -0.08)
+valid_data$bc_sulphates      <- bc_transform(valid_data$sulphates,             -1.00)
+
+# For models with transformed response
+valid_data$bc_alcohol <- power_transform(valid_data$alcohol, lambda_alc)
+```
+
+```{r sec15, message=FALSE, warning=FALSE}
+## ---- 15. Train vs validation RMSE for all models ----
+
+# 1) Model1 (raw y)
+pred1_train <- predict(model1, newdata = train_data)
+pred1_valid <- predict(model1, newdata = valid_data)
+
+rmse1_train <- rmse(train_data$alcohol, pred1_train)
+rmse1_valid <- rmse(valid_data$alcohol, pred1_valid)
+
+# 2) Models with bc_alcohol response: 2–7
+models_bc <- list(
+  Model2 = model2,
+  Model3 = model3,
+  Model4 = model4,
+  Model5 = model5,
+  Model6 = model6,
+  Model7 = model7
+)
+
+rmse_train_vec <- numeric(length(models_bc))
+rmse_valid_vec <- numeric(length(models_bc))
+
+i <- 1
+for (nm in names(models_bc)) {
+  m <- models_bc[[nm]]
+  
+  pred_bc_train <- predict(m, newdata = train_data)
+  pred_bc_valid <- predict(m, newdata = valid_data)
+  
+  pred_alc_train <- inv_power_transform(pred_bc_train, lambda_alc)
+  pred_alc_valid <- inv_power_transform(pred_bc_valid, lambda_alc)
+  
+  rmse_train_vec[i] <- rmse(train_data$alcohol, pred_alc_train)
+  rmse_valid_vec[i] <- rmse(valid_data$alcohol, pred_alc_valid)
+  
+  i <- i + 1
+}
+
+rmse_df <- data.frame(
+  Model       = c("Model1", names(models_bc)),
+  RMSE_Train  = c(rmse1_train, rmse_train_vec),
+  RMSE_Valid  = c(rmse1_valid, rmse_valid_vec)
+)
+
+print(rmse_df)
+```
+
+```{r sec16, message=FALSE, warning=FALSE}
+## ---- 16. Final graphical comparison: validation RMSE by model ----
+cols <- c("bc_alcohol",          "bc_residual_sugar",     "bc_chlorides",         
+          "bc_free_SO2",           "bc_total_SO2",         "bc_sulphates", 
+          "fixed acidity",         "volatile acidity" ,     "citric acid" ,
+          "density")
+pairs(train_data[, cols], 
+      main = "Pairwise plots of transformem/raw variables")
+
+i <- 1
+for (nm in names(models_bc)) {
+  m <- models_bc[[nm]]
+  
+  # predictions on transformed scale
+  pred_bc_train <- predict(m, newdata = train_data)
+  pred_bc_valid <- predict(m, newdata = valid_data)
+  
+  # back-transform to original alcohol scale
+  pred_alc_train <- inv_power_transform(pred_bc_train, lambda_alc)
+  pred_alc_valid <- inv_power_transform(pred_bc_valid, lambda_alc)
+  
+  rmse_train_vec[i] <- rmse(train_data$alcohol, pred_alc_train)
+  rmse_valid_vec[i] <- rmse(valid_data$alcohol, pred_alc_valid)
+  
+  i <- i + 1
+}
+
+## Combine all RMSEs in one data frame
+rmse_df <- data.frame(
+  Model      = c("Model1", names(models_bc)),
+  RMSE_Train = c(rmse1_train, rmse_train_vec),
+  RMSE_Valid = c(rmse1_valid, rmse_valid_vec)
+)
+
+print(rmse_df)
+
+## Create a grouped barplot: for EACH MODEL, show Train vs Validation RMSE
+rmse_matrix <- rbind(rmse_df$RMSE_Train, rmse_df$RMSE_Valid)
+rownames(rmse_matrix) <- c("Training", "Validation")
+
+barplot(
+  rmse_matrix,
+  beside    = TRUE,
+  names.arg = rmse_df$Model,
+  main      = "RMSE by Model and Dataset",
+  ylab      = "RMSE (original alcohol scale)",
+  legend.text = rownames(rmse_matrix),
+  args.legend = list(
+    x     = "topright",
+    inset = c(-0.02, -0.14),  # move left and down a bit
+    bty   = "n"
+  ),
+  las       = 3
+)
+
+```
